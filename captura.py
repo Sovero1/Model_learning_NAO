@@ -1,106 +1,86 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import tensorflow as tf  # O PyTorch si usas otro framework
-import socket
-import json
-from tensorflow.keras import losses
-
-# Carga el modelo especificando las funciones estándar
-model = tf.keras.models.load_model("my_model.h5", custom_objects={"mse": losses.MeanSquaredError()})
+from keras.models import load_model
 
 
-# Conexión al socket del NAO
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(("127.0.0.1", 6000))  # IP del servidor NAO/controlador
+# === CONFIGURACIÓN ===
 
-# Inicialización MediaPipe
-mp_drawing = mp.solutions.drawing_utils
-mp_holistic = mp.solutions.holistic
+# Cargar modelo entrenado
+modelo = load_model('my_model.h5', compile=False)
 
+
+# Media y desviación estándar usadas en el entrenamiento (ajusta con tus valores)
+media = np.array([0.5, 0.5, 0.0, 0.0, 0.0, 0.0])  # ejemplo: centro de imagen
+std = np.array([0.2, 0.2, 0.2, 1.0, 1.0, 1.0])    # ejemplo
+
+# Inicializar MediaPipe
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
+
+
+# Inicializar cámara
 cap = cv2.VideoCapture(0)
 
-def normalize_data(position, orientation):
-    position_max = [3000, 3000, 3000]  # Máximos de los valores de posición (en milímetros)
-    orientation_max = [180, 180, 180]  # Máximos de grados para la orientación
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-    # Normalización
-    position_norm = [p / m for p, m in zip(position, position_max)]
-    orientation_norm = [r / m for r, m in zip(orientation, orientation_max)]
-    
-    return position_norm + orientation_norm
+    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(image_rgb)
 
-# Función para extraer la posición y orientación del efector final (mano)
-def extract_hand_position_and_orientation(holistic_results):
-    # Puntos clave de los brazos
-    left_wrist = holistic_results.pose_landmarks.landmark[mp_holistic.PoseLandmark.LEFT_WRIST]
-    right_wrist = holistic_results.pose_landmarks.landmark[mp_holistic.PoseLandmark.RIGHT_WRIST]
-    
-    # Extraer posición de la mano (efector final)
-    left_hand_position = [left_wrist.x, left_wrist.y, left_wrist.z]
-    right_hand_position = [right_wrist.x, right_wrist.y, right_wrist.z]
-    
-    # Aquí puedes calcular la orientación basada en los codos y hombros
-    # Para simplificar, asumimos que usamos solo la posición para la predicción, pero puedes agregar la orientación usando rotaciones.
-    return left_hand_position, right_hand_position
+    if results.pose_landmarks:
+        lm = results.pose_landmarks.landmark
 
-# Captura de video y procesamiento
-with mp_holistic.Holistic(static_image_mode=False, model_complexity=1) as holistic:
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+        # Extraer landmarks necesarios
+        shoulder = np.array([lm[mp_pose.PoseLandmark.LEFT_SHOULDER].x,
+                             lm[mp_pose.PoseLandmark.LEFT_SHOULDER].y,
+                             lm[mp_pose.PoseLandmark.LEFT_SHOULDER].z])
+        elbow = np.array([lm[mp_pose.PoseLandmark.LEFT_ELBOW].x,
+                          lm[mp_pose.PoseLandmark.LEFT_ELBOW].y,
+                          lm[mp_pose.PoseLandmark.LEFT_ELBOW].z])
+        wrist = np.array([lm[mp_pose.PoseLandmark.LEFT_WRIST].x,
+                          lm[mp_pose.PoseLandmark.LEFT_WRIST].y,
+                          lm[mp_pose.PoseLandmark.LEFT_WRIST].z])
 
-        # Convertir la imagen a RGB para MediaPipe
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Calcular posición media como [Px, Py, Pz]
+        position = (shoulder + wrist) / 2
+
+        # Calcular orientación: vector del hombro al codo
+        orientation = elbow - shoulder
+        norm = np.linalg.norm(orientation)
+        if norm == 0:
+            continue  # evitar división por cero
+        orientation /= norm  # Rx, Ry, Rz
+
+        entrada = np.concatenate([position, orientation])  # [Px, Py, Pz, Rx, Ry, Rz]
+
+        # Normalizar la entrada
+        entrada_norm = (entrada - media) / std  
+        entrada_norm = np.array(entrada_norm, dtype=np.float32).reshape(1, -1)
+                #print("Entrada para el modelo:", entrada_norm.shape, entrada_norm.dtype)
+
+
+        # Predicción
         
-        # Procesar la imagen con MediaPipe
-        holistic_results = holistic.process(image_rgb)
+        angulos = modelo.predict(entrada_norm)[0]  # [θ1, θ2, θ3, θ4, θ5]
 
-        annotated_frame = frame.copy()
-        mp_drawing.draw_landmarks(annotated_frame, holistic_results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
-        
-        # Si se detecta cuerpo, extraemos la posición y orientación del efector final
-        if holistic_results.pose_landmarks:
-            left_hand_position, right_hand_position = extract_hand_position_and_orientation(holistic_results)
-            
-            # Normalizar las posiciones y orientaciones
-            input_data_left = normalize_data(left_hand_position, [0, 0, 0])  # La orientación se puede calcular, pero por ahora ponemos [0, 0, 0]
-            input_data_right = normalize_data(right_hand_position, [0, 0, 0])
+        # Mostrar resultados
+        for i, ang in enumerate(angulos):
+            cv2.putText(frame, f"Theta {i+1}: {ang:.3f} rad",
+                        (10, 30 + i * 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2)
 
-            # Predicción de los ángulos usando el modelo
-            input_array = np.array([input_data_left + input_data_right])  # Combina ambas manos si es necesario
-            predicted_angles = model.predict(input_array)
+        # Dibujar los puntos en pantalla
+        h, w, _ = frame.shape
+        for pt in [shoulder, elbow, wrist]:
+            cx, cy = int(pt[0] * w), int(pt[1] * h)
+            cv2.circle(frame, (cx, cy), 6, (255, 0, 0), -1)
 
-            # Mapeo de los valores predichos a los ángulos de las articulaciones
-            angles = {
-                "LShoulderPitch": predicted_angles[0][0],
-                "LShoulderRoll": predicted_angles[0][1],
-                "LElbowYaw": predicted_angles[0][2],
-                "LElbowRoll": predicted_angles[0][3],
-                "LWristYaw": predicted_angles[0][4],
-                "RShoulderPitch": predicted_angles[0][5],
-                "RShoulderRoll": predicted_angles[0][6],
-                "RElbowYaw": predicted_angles[0][7],
-                "RElbowRoll": predicted_angles[0][8],
-                "RWristYaw": predicted_angles[0][9]
-            }
-
-            # Enviar los ángulos al robot NAO a través del socket
-            try:
-                payload = json.dumps(angles)
-                print("Enviando al NAO:", payload)
-                sock.sendall(payload.encode("utf-8"))
-                print("-->>> Ángulos enviados.")
-            except Exception as e:
-                print("Error al enviar ángulos:", e)
-        
-        # Mostrar la imagen con las marcas de MediaPipe
-        cv2.imshow("NAO Tracker", cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR))
-        
-        if cv2.waitKey(1) & 0xFF == 27:  # Esc para salir
-            break
+    cv2.imshow('Brazo izquierdo + predicción', frame)
+    if cv2.waitKey(1) & 0xFF == 27:  # ESC para salir
+        break
 
 cap.release()
 cv2.destroyAllWindows()
-sock.close()
